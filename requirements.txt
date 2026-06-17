@@ -1,0 +1,14 @@
+langgraph
+langchain-community
+litellm
+sentence-transformers
+faiss-cpu
+networkx
+datasets
+ragas
+matplotlib
+gradio
+fastapi
+uvicorn
+wandb
+python-dotenv
