@@ -5,3 +5,4 @@ __pycache__/
 .ipynb_checkpoints/
 agentic-graphRAG.ipynb
 agentic-graphrag-build-plan.md
+data/

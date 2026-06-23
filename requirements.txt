@@ -13,3 +13,4 @@ uvicorn
 wandb
 python-dotenv
 numpy
+pyyaml
