@@ -12,6 +12,44 @@ HotpotQA questions come in two flavors:
 
 Each question ships with `supporting_facts` — the exact sentences a human used to answer it — so retrieval quality can be checked against ground truth, not just final-answer string matching.
 
+## System A: naive vector RAG
+
+The baseline. [`src/vector_store.py`](src/vector_store.py) embeds every passage once with `bge-small-en-v1.5`, stores the vectors in a FAISS `IndexFlatIP` (cosine similarity via normalized inner product), and at query time embeds the question and returns the `top_k` nearest passages — no structure, no multi-hop reasoning, just "what reads most like this question."
+
+```
+question ──► embed (bge-small-en-v1.5) ──► FAISS IndexFlatIP.search(k) ──► top-k passages ──► src/generate.py
+```
+
+This is fast and has zero extraction cost, and it's exactly as good as the question's wording overlaps with the answer passage's wording. That's also why bridge questions break it: when the entity that would make the question and the answer passage textually similar is never named in the question, nothing in embedding space points toward it. See the case study below.
+
+Run it: `python -m src.vector_store` (builds/loads the index and prints the top-5 results for a sample question).
+
+## System B: GraphRAG
+
+[`src/extract_triples.py`](src/extract_triples.py) makes one LLM call per batch of passages, asking for `(head, relation, tail)` triples tagged with the chunk id they came from. [`src/graph_store.py`](src/graph_store.py) folds every triple into a `networkx.MultiDiGraph` — nodes are normalized entity strings, edges carry the relation label and the source chunk id.
+
+At query time, `GraphRetriever`:
+1. **links** the query to the `top_n` graph nodes closest to it by embedding similarity (`link_entities`),
+2. **walks** outward `k_hops` steps (both in- and out-edges) from those seed nodes,
+3. **collects** the source chunk id off every edge it crosses along the way.
+
+```
+question ──► link_entities (embed, nearest graph nodes) ──► seed entities
+                                                                  │
+                                            k_hops × (out-edges + in-edges) walk
+                                                                  │
+                                                source chunk ids of every edge crossed
+                                                                  │
+                                                                  ▼
+                                                          src/generate.py
+```
+
+This is what lets GraphRAG answer bridge questions vector search can't: it doesn't need the connecting entity's name to appear in the question, only somewhere reachable within `k_hops` of whatever the question *does* name. The cost is that the walk is noisy — even a focused `k=2` neighborhood pulls in a lot of structurally-near but semantically-irrelevant chunks, and it's only as good as the entity normalization underneath it (see "Where the graph also fails," below).
+
+![A real, unfiltered 2-hop neighborhood pulled for a bridge question](assets/bridge_subgraph.png)
+
+Run it: `python -m src.graph_store` (builds/loads the graph and prints node/edge counts plus a sample entity-linking result).
+
 ## Case study: one bridge question, two outcomes
 
 To make the comparison concrete rather than aggregate-metric abstract, here are two real runs against the same pipeline, on the same partially-built graph.
