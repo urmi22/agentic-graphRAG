@@ -42,6 +42,50 @@ This is the central, recurring failure mode of any LLM-extracted knowledge graph
 
 Reproduce either case yourself: [`scripts/demo_bridge_success.py`](scripts/demo_bridge_success.py) / [`scripts/demo_bridge_question.py`](scripts/demo_bridge_question.py).
 
+## System C: the agentic LangGraph state machine
+
+This is the centerpiece of the project. Systems A and B are fixed pipelines — pick a retriever, retrieve once, generate. System C (`src/agent.py`) is a [LangGraph](https://github.com/langchain-ai/langgraph) state machine that decides *how* to retrieve, checks whether what it found is actually enough, and rewrites its own query and retries before giving up — rather than retrieving once and hoping.
+
+![Agent state machine](assets/agent_state_machine.png)
+
+*(rendered directly from the compiled graph via `agent.get_graph().draw_mermaid_png()` — not hand-drawn)*
+
+**Nodes:**
+- **route** — the LLM classifies the question into `vector` (single-passage lookup), `graph` (multi-hop), or `hybrid`, constrained to one word.
+- **retrieve** — runs the retriever(s) implied by `route`, and **accumulates** results into the running context (deduped by chunk id) rather than replacing it on every call — see why below.
+- **grade** — the LLM judges, against the *original* question, whether the accumulated context is sufficient; returns yes/no plus a one-line reason.
+- **rewrite** — on a "no", the LLM rewrites the *retrieval* query (decomposing the bridge, or naming the connecting entity it suspects) and loops back to `retrieve`. Capped at `agent.max_retries` (2, in `config.yaml`) so a stubborn miss can't loop forever.
+- **generate** — answers the *original* question from the accumulated context, citing the chunk id(s) used, e.g. `[chunk_43]`.
+
+Two choices here diverge from the most literal reading of this loop, both forced by testing against real questions rather than picked upfront:
+
+1. **Grading and final generation use the original question, never the rewritten one.** The rewritten text is a retrieval aid, not a replacement question — if it leaked into the final prompt, the agent would answer the sub-question it invented instead of the one actually asked.
+2. **Context accumulates across retries instead of being replaced.** The first version replaced context on every `retrieve` call — the more obvious implementation. It broke exactly the question the loop was supposed to fix (next section).
+
+### The loop earning its keep
+
+Three questions run through the compiled agent (`python -m scripts.demo_agent`) land in the three states this graph can end in:
+
+| Question | Route | Retries used | Final answer |
+|---|---|---|---|
+| "Were Scott Derrickson and Ed Wood of the same nationality?" | `graph` | 0 — sufficient immediately | "Yes, ... American `[chunk_1, chunk_4]`." |
+| "The director of 'Big Stone Gap' is based in what New York city?" | `vector` | 2 — rewrite triggered | "...Adriana Trigiani, is based in Greenwich Village, New York City `[chunk_43]`." |
+| "What government position was held by the woman who portrayed Corliss Archer in *Kiss and Tell*?" | `vector` | 2 — rewrite triggered | "...Shirley Temple. ...served as Chief of Protocol of the United States `[chunk_11]`." |
+
+The third row is why context accumulation exists. Walking through it:
+
+1. **route** classifies it `vector`.
+2. **retrieve** runs vector search on the original question. It finds `chunk_16` (*Kiss and Tell*, which names Shirley Temple) but not her biography passage — the question never says her name, so nothing in it is textually close to her bio.
+3. **grade** correctly says "no": nothing in context states what government position she held.
+4. **rewrite** doesn't just rephrase — it uses the LLM's own world knowledge to name the bridge entity explicitly: *"What government position was held by Shirley Temple, the American actress and diplomat..."*
+5. **retrieve** runs again on the rewritten query and finds `chunk_11` (her biography, with the Chief of Protocol fact) — **and keeps `chunk_16` from step 2** instead of discarding it.
+6. **grade** is still conservative and says "no" again (it wants the *Kiss and Tell*/Corliss Archer link stated more explicitly); the loop has now used its 2 retries and proceeds to `generate` regardless.
+7. **generate**, with both passages in context, correctly answers "Chief of Protocol of the United States `[chunk_11]`" — and correctly attributes the role to "the woman who portrayed Corliss Archer," because `chunk_16` is still there to ground that connection.
+
+Without step 5's accumulation, this exact question regresses to "I don't know": a query specific enough to find Shirley Temple's bio has nothing to do with "Kiss and Tell" textually, so a context-*replacing* retrieve would throw away the one passage connecting her to the question at all. The bridge-question problem this whole project is built around — the connecting entity isn't named in the question — reappears one level deeper, inside the rewrite loop itself, and accumulation is what actually resolves it.
+
+This also means System C recovers from a failure that defeated *both* System A and System B in the case study above: the Shirley Temple alias-split that fractured the graph (`shirley temple` vs `shirley temple black`) doesn't matter here, because the agent never depends on graph traversal connecting those two nodes — query rewriting reaches the answer passage through vector search instead.
+
 ## Architecture
 
 ```
@@ -67,8 +111,9 @@ HotpotQA (500 questions, distractor config)
                          (shared context-grounded prompt,
                           shared across all systems via LiteLLM)
 
- System C (planned): LangGraph agent that routes between vector/graph
- retrieval, grades retrieved context, and rewrites the query on a miss.
+ System C: src/agent.py — LangGraph agent that routes between vector/graph
+ retrieval, grades retrieved context, rewrites the query on a miss, and
+ cites source chunk ids in its final answer. See the dedicated section above.
 ```
 
 All three systems share the same corpus, the same embedding model, and the same generation prompt — only the retrieval step differs. That's deliberate: it isolates retrieval strategy as the only variable being compared.
@@ -82,7 +127,7 @@ All three systems share the same corpus, the same embedding model, and the same 
 | 2 | System A: vector index + retrieval (`src/vector_store.py`) | done |
 | 3 | Triple extraction (`src/extract_triples.py`) | in progress — 350 / 4,937 chunks extracted |
 | 3 | Graph construction + k-hop retrieval (`src/graph_store.py`) | done, validated on the partial graph above |
-| 4 | System C: LangGraph agentic router/grader/rewriter | not started |
+| 4 | System C: LangGraph agentic router/grader/rewriter (`src/agent.py`) | done, validated on the partial graph above |
 | 5 | Evaluation harness (ragas) across all three systems | not started |
 
 Triple extraction is bottlenecked by free-tier LLM rate limits (Groq: 100k tokens/day; Gemini: 20 requests/day on the current API key) rather than anything algorithmic — it resumes safely across runs via an on-disk JSONL ledger keyed by `chunk_id`, so it's just a matter of letting it run across multiple days, or switching to a paid tier.
@@ -105,6 +150,7 @@ python -m src.extract_triples     # LLM-extract triples → data/triples.jsonl (
 python -m src.graph_store         # build the graph from cached triples (System B)
 python -m scripts.demo_bridge_success    # walk + visualize a working bridge case
 python -m scripts.demo_bridge_question   # walk + visualize the entity-resolution failure case
+python -m scripts.demo_agent             # run System C across all three cases above
 ```
 
 Each script is independently resumable and reads from cached `data/*.jsonl` / `data/*.pkl` artifacts where available, so re-running the pipeline doesn't redo expensive embedding or LLM-extraction work.
@@ -119,11 +165,14 @@ src/
   generate.py          # shared context-grounded generation prompt (LiteLLM)
   extract_triples.py   # batched, resumable LLM triple extraction
   graph_store.py        # graph construction + k-hop GraphRetriever (System B)
+  agent.py             # LangGraph router/retrieve/grade/rewrite/generate agent (System C)
   llm.py               # thin LiteLLM wrapper (model-agnostic completion)
 scripts/
   demo_bridge_success.py   # case study: graph traversal succeeds
   demo_bridge_question.py  # case study: graph traversal fails (entity-alias gap)
-config.yaml          # models, embedding model, top_k, k_hops, dataset params
+  demo_agent.py             # System C across all three cases
+config.yaml          # models, embedding model, top_k, k_hops, max_retries, dataset params
+assets/                # diagrams referenced in this README (tracked, unlike data/)
 ```
 
 `data/` (HotpotQA cache, FAISS index, extracted triples, graph pickle) is gitignored — regenerate it locally via the commands above.
