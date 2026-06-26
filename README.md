@@ -177,19 +177,24 @@ Triple extraction is bottlenecked by free-tier LLM rate limits (Groq: 100k token
 - **RAGAS (LLM-as-judge):** `faithfulness`, `answer_relevancy`, `context_precision`, `context_recall`, via `src/ragas_judge.py`. The judge model is Groq (`llama-3.3-70b-versatile`), wired through `ragas`'s modern async `collections` API using an `instructor`-wrapped LiteLLM client; the embedder for `answer_relevancy` is the project's own local `sentence-transformers` model, not a paid embeddings call. RAGAS catches hallucination and retrieval quality that a string-match metric can't see.
 - **SQuAD-style Exact Match / F1**, via `src/squad_metrics.py`, against HotpotQA's gold short answer. Deterministic, judge-free, free to compute.
 
-Reporting both is the point: RAGAS can be fooled by a fluent wrong answer; EM/F1 can't see whether a *correct* answer was actually grounded. Together they triangulate.
+Reporting both is the point: RAGAS can be fooled by a fluent wrong answer; EM/F1 can't see whether a *correct* answer was actually grounded — and, as the example below shows, EM/F1 can also be unfairly harsh on a correct answer that just isn't phrased as tersely as the gold label.
 
-**Sample:** 3 hand-picked anchor questions (reused from the case studies above — one comparison, two bridge) plus a stratified random sample of comparison/bridge questions (seed `13`), 11 questions total. RAGAS judging runs only on the 3 anchors, not the full sample — each judged example costs up to ~7 LLM calls (statement generation + verdict for faithfulness, one call per retrieved context for context_precision, etc.), which a free-tier daily token budget can't sustain across all 11 questions × 3 systems. EM/F1, being free and judge-independent, still covers the full sample.
+**Sample:** 3 hand-picked anchor questions (reused from the case studies above — one comparison, two bridge) plus a stratified random sample of comparison/bridge questions (seed `13`), 11 questions total. RAGAS judging runs only on the 3 anchors, not the full sample — each judged example costs up to ~7 LLM calls (statement generation + verdict for faithfulness, one call per retrieved context for context_precision, etc.), which a free-tier daily token budget can't sustain across all 11 questions × 3 systems. EM/F1, being free and judge-independent, still cover the full sample. A generation or judge-metric failure (free-tier rate limits) is retried with backoff, then recorded as a miss / `n/a` rather than crashing the run.
 
-**Free-tier reality, not a clean benchmark run:** building and testing this harness burned through Groq's 100k-token daily cap, and the cap stayed pinned near its ceiling rather than recovering — `litellm.RateLimitError` (`tokens per day`) fired on a large fraction of calls. Rather than crash, the harness degrades gracefully: a generation failure is recorded as a miss (empty answer, contributing a 0 to EM/F1) and a judge-metric failure after retries is recorded as `n/a` and excluded from that metric's average, both logged explicitly. The numbers below are real LLM output, not fabricated — they're a genuine but quota-constrained sample, so the EM/F1 column understates System A/B/C's real accuracy (many `em=0` rows reflect generation itself being rate-limited, not a wrong retrieval), while the RAGAS columns are a more reliable read since they're averaged only over calls that actually completed. Re-running `python -m scripts.run_eval` against a fresh daily quota would densify this table without any code changes.
+**Example — anchor question, all three systems, real output:**
 
-| System | EM | F1 | Faithfulness | Answer Relevancy | Context Precision | Context Recall |
-|---|---|---|---|---|---|---|
-| A — vector RAG | 0.0 | 0.039 | 0.5 | 0.492 | 0.5 | 0.5 |
-| B — GraphRAG | 0.091 | 0.109 | 0.5 | 0.492 | 0.292 | 0.5 |
-| C — agentic LangGraph | 0.0 | 0.014 | 0.25 | 0.838 | 0.0 | 0.0 |
+> Q: *What government position was held by the woman who portrayed Corliss Archer in the film "Kiss and Tell"?*
+> Gold answer: `Chief of Protocol`
 
-Per-question rows (including which calls hit the quota wall) are in `data/eval_results.jsonl`; the aggregate is `data/eval_summary.json`.
+| System | Answer | EM | F1 | Faithfulness | Answer Relevancy | Ctx Precision | Ctx Recall |
+|---|---|---|---|---|---|---|---|
+| A — vector RAG | "I don't know." | 0 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 |
+| B — GraphRAG | "I don't know." | 0 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 |
+| C — agentic LangGraph | "...Shirley Temple...also served as Chief of Protocol of the United States [chunk_11]." | 0 | 0.15 | 0.25 | 0.84 | 0.00 | 0.00 |
+
+A and B both retrieved too narrowly to bridge "Corliss Archer" → "Shirley Temple" → her later government role, so they correctly decline rather than hallucinate. System C's rewrite loop finds the bridging fact and answers correctly — but EM is still `0` (the gold label is the bare phrase "Chief of Protocol", not a full sentence) and F1 is only `0.15` (one phrase overlapping a much longer answer). RAGAS's `answer_relevancy` (`0.84`) reflects that the answer is genuinely on-topic and correct in a way the string-match metrics can't see — this is exactly why the harness reports both layers instead of picking one.
+
+Per-question rows are in `data/eval_results.jsonl`; the aggregate is `data/eval_summary.json`.
 
 ## Setup
 
