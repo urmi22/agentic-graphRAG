@@ -1,0 +1,26 @@
+{
+  "A": {
+    "em": 0.0,
+    "f1": 0.039,
+    "faithfulness": 0.5,
+    "answer_relevancy": 0.492,
+    "context_precision": 0.5,
+    "context_recall": 0.5
+  },
+  "B": {
+    "em": 0.091,
+    "f1": 0.109,
+    "faithfulness": 0.5,
+    "answer_relevancy": 0.492,
+    "context_precision": 0.292,
+    "context_recall": 0.5
+  },
+  "C": {
+    "em": 0.0,
+    "f1": 0.014,
+    "faithfulness": 0.25,
+    "answer_relevancy": 0.838,
+    "context_precision": 0.0,
+    "context_recall": 0.0
+  }
+}

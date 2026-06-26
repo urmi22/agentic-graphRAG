@@ -15,6 +15,11 @@ graph:
 agent:
   max_retries: 2
 
+eval:
+  sample_per_type: 4    # comparison + bridge questions drawn at random, on top of the 3 anchor cases
+  seed: 13
+  judge_sleep_s: 4.0     # throttle between judge-LLM calls to stay under free-tier RPM/TPM
+
 dataset:
   name: hotpotqa/hotpot_qa
   subset: distractor

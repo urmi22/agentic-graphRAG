@@ -166,9 +166,30 @@ All three systems share the same corpus, the same embedding model, and the same 
 | 3 | Triple extraction (`src/extract_triples.py`) | in progress — 350 / 4,937 chunks extracted |
 | 3 | Graph construction + k-hop retrieval (`src/graph_store.py`) | done, validated on the partial graph above |
 | 4 | System C: LangGraph agentic router/grader/rewriter (`src/agent.py`) | done, validated on the partial graph above |
-| 5 | Evaluation harness (ragas) across all three systems | not started |
+| 5 | Evaluation harness (ragas) across all three systems | done — `scripts/run_eval.py` |
 
 Triple extraction is bottlenecked by free-tier LLM rate limits (Groq: 100k tokens/day; Gemini: 20 requests/day on the current API key) rather than anything algorithmic — it resumes safely across runs via an on-disk JSONL ledger keyed by `chunk_id`, so it's just a matter of letting it run across multiple days, or switching to a paid tier.
+
+## Evaluation
+
+`scripts/run_eval.py` scores Systems A, B, and C on the same question set with two independent layers:
+
+- **RAGAS (LLM-as-judge):** `faithfulness`, `answer_relevancy`, `context_precision`, `context_recall`, via `src/ragas_judge.py`. The judge model is Groq (`llama-3.3-70b-versatile`), wired through `ragas`'s modern async `collections` API using an `instructor`-wrapped LiteLLM client; the embedder for `answer_relevancy` is the project's own local `sentence-transformers` model, not a paid embeddings call. RAGAS catches hallucination and retrieval quality that a string-match metric can't see.
+- **SQuAD-style Exact Match / F1**, via `src/squad_metrics.py`, against HotpotQA's gold short answer. Deterministic, judge-free, free to compute.
+
+Reporting both is the point: RAGAS can be fooled by a fluent wrong answer; EM/F1 can't see whether a *correct* answer was actually grounded. Together they triangulate.
+
+**Sample:** 3 hand-picked anchor questions (reused from the case studies above — one comparison, two bridge) plus a stratified random sample of comparison/bridge questions (seed `13`), 11 questions total. RAGAS judging runs only on the 3 anchors, not the full sample — each judged example costs up to ~7 LLM calls (statement generation + verdict for faithfulness, one call per retrieved context for context_precision, etc.), which a free-tier daily token budget can't sustain across all 11 questions × 3 systems. EM/F1, being free and judge-independent, still covers the full sample.
+
+**Free-tier reality, not a clean benchmark run:** building and testing this harness burned through Groq's 100k-token daily cap, and the cap stayed pinned near its ceiling rather than recovering — `litellm.RateLimitError` (`tokens per day`) fired on a large fraction of calls. Rather than crash, the harness degrades gracefully: a generation failure is recorded as a miss (empty answer, contributing a 0 to EM/F1) and a judge-metric failure after retries is recorded as `n/a` and excluded from that metric's average, both logged explicitly. The numbers below are real LLM output, not fabricated — they're a genuine but quota-constrained sample, so the EM/F1 column understates System A/B/C's real accuracy (many `em=0` rows reflect generation itself being rate-limited, not a wrong retrieval), while the RAGAS columns are a more reliable read since they're averaged only over calls that actually completed. Re-running `python -m scripts.run_eval` against a fresh daily quota would densify this table without any code changes.
+
+| System | EM | F1 | Faithfulness | Answer Relevancy | Context Precision | Context Recall |
+|---|---|---|---|---|---|---|
+| A — vector RAG | 0.0 | 0.039 | 0.5 | 0.492 | 0.5 | 0.5 |
+| B — GraphRAG | 0.091 | 0.109 | 0.5 | 0.492 | 0.292 | 0.5 |
+| C — agentic LangGraph | 0.0 | 0.014 | 0.25 | 0.838 | 0.0 | 0.0 |
+
+Per-question rows (including which calls hit the quota wall) are in `data/eval_results.jsonl`; the aggregate is `data/eval_summary.json`.
 
 ## Setup
 
